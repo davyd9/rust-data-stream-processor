@@ -1,121 +1,169 @@
-use crate::cli::Cli;
+use crate::cli::DataFormat;
 use crate::error::AppError;
-use log::{debug, info};
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use crate::filter::FilterCondition;
+use futures::stream::StreamExt;
+use serde_json::Value;
+use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 
-/// Asynchronously opens the input file specified in the CLI arguments and processes it line by line.
-///
-/// This function is designed for memory efficiency, as it reads the file as a stream
-/// and does not load the entire content into memory. It logs the number of lines processed.
-///
-/// # Arguments
-///
-/// * `cli` - A reference to the parsed command-line arguments containing the input file path.
-///
-/// # Returns
-///
-/// A `Result` which is `Ok(())` on successful processing of the entire file, or an `AppError`
-/// if any I/O error occurs.
-pub async fn process_stream(cli: &Cli) -> Result<(), AppError> {
-    info!("Starting to process stream from file: '{}'", cli.input);
+/// Processes the input stream based on the specified data format, applies an optional filter,
+/// and writes the results to the output stream as JSONL.
+pub async fn process_stream<R, W>(
+    reader: R,
+    writer: W,
+    format: DataFormat,
+    filter_expr: Option<String>,
+) -> Result<(), AppError>
+where
+    R: AsyncBufRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let filter = filter_expr
+        .map(|expr| FilterCondition::new(&expr))
+        .transpose()?;
 
-    let file = File::open(&cli.input).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut buf_writer = BufWriter::new(writer);
 
-    let mut line_count: u64 = 0;
-    while let Some(line) = lines.next_line().await? {
-        // Placeholder for future data transformation and filtering logic
-        debug!("Read line [{}]: {}", line_count + 1, line);
-        line_count += 1;
+    match format {
+        DataFormat::Json => process_json_stream(reader, &mut buf_writer, filter.as_ref()).await?,
+        DataFormat::Csv => process_csv_stream(reader, &mut buf_writer, filter.as_ref()).await?,
     }
 
-    info!(
-        "Successfully processed {} lines from '{}'",
-        line_count,
-        &cli.input
-    );
+    buf_writer.flush().await?;
+    Ok(())
+}
 
+/// Processes a JSONL (JSON Lines) stream.
+async fn process_json_stream<R, W>(
+    reader: R,
+    writer: &mut W,
+    filter: Option<&FilterCondition>,
+) -> Result<(), AppError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = reader.lines();
+    while let Some(line_result) = lines.next_line().await? {
+        if line_result.trim().is_empty() {
+            continue;
+        }
+
+        let record: Value = serde_json::from_str(&line_result)
+            .map_err(|e| AppError::ParseError(e.to_string()))?;
+
+        if filter.map_or(true, |f| f.apply(&record)) {
+            let mut output_line = serde_json::to_string(&record)?;
+            output_line.push('\n');
+            writer.write_all(output_line.as_bytes()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Processes a CSV stream.
+async fn process_csv_stream<R, W>(
+    reader: R,
+    writer: &mut W,
+    filter: Option<&FilterCondition>,
+) -> Result<(), AppError>
+where
+    R: AsyncBufRead + Unpin + Send,
+    W: AsyncWrite + Unpin,
+{
+    let mut csv_reader = csv_async::AsyncReaderBuilder::new()
+        .has_headers(true)
+        .create_reader(reader);
+
+    let headers = csv_reader
+        .headers()
+        .await?
+        .iter()
+        .map(String::from)
+        .collect::<Vec<String>>();
+
+    let mut records = csv_reader.records();
+    while let Some(record_result) = records.next().await {
+        let record = record_result?;
+        let mut json_map = serde_json::Map::new();
+
+        for (i, value) in record.iter().enumerate() {
+            if let Some(header) = headers.get(i) {
+                json_map.insert(header.clone(), Value::String(value.to_string()));
+            }
+        }
+
+        let json_value = Value::Object(json_map);
+
+        if filter.map_or(true, |f| f.apply(&json_value)) {
+            let mut output_line = serde_json::to_string(&json_value)?;
+            output_line.push('\n');
+            writer.write_all(output_line.as_bytes()).await?;
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Format};
-    use std::path::PathBuf;
-    use uuid::Uuid;
+    use crate::cli::DataFormat;
+    use std::io::Cursor;
 
-    /// Creates a temporary file with specified content for testing purposes.
-    async fn create_temp_test_file(content: &str) -> PathBuf {
-        let temp_dir = std::env::temp_dir();
-        let file_name = format!("test-{}.log", Uuid::new_v4());
-        let file_path = temp_dir.join(file_name);
-        tokio::fs::write(&file_path, content).await.unwrap();
-        file_path
+    async fn run_processing_test(
+        input: &str,
+        format: DataFormat,
+        filter: Option<String>,
+        expected: &str,
+    ) {
+        let reader = io::BufReader::new(Cursor::new(input.as_bytes()));
+        let mut writer = Vec::new();
+
+        process_stream(reader, &mut writer, format, filter)
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(writer).unwrap();
+        assert_eq!(output, expected);
     }
 
     #[tokio::test]
-    async fn test_process_stream_success() {
-        // Arrange
-        let file_content = "line 1\nline 2\nline 3";
-        let file_path = create_temp_test_file(file_content).await;
-        let cli = Cli {
-            input: file_path.to_str().unwrap().to_string(),
-            output: None,
-            format: Format::Json,
-        };
-
-        // Act
-        let result = process_stream(&cli).await;
-
-        // Assert
-        assert!(result.is_ok());
-
-        // Cleanup
-        tokio::fs::remove_file(file_path).await.unwrap();
+    async fn test_process_json_stream_no_filter() {
+        let input = r#"{"id":1,"name":"A"}
+{"id":2,"name":"B"}"#;
+        let expected = "{\"id\":1,\"name\":\"A\"}\n{\"id\":2,\"name\":\"B\"}\n";
+        run_processing_test(input, DataFormat::Json, None, expected).await;
     }
 
     #[tokio::test]
-    async fn test_process_stream_empty_file() {
-        // Arrange
-        let file_path = create_temp_test_file("").await;
-        let cli = Cli {
-            input: file_path.to_str().unwrap().to_string(),
-            output: None,
-            format: Format::Json,
-        };
-
-        // Act
-        let result = process_stream(&cli).await;
-
-        // Assert
-        assert!(result.is_ok());
-
-        // Cleanup
-        tokio::fs::remove_file(file_path).await.unwrap();
+    async fn test_process_json_stream_with_filter() {
+        let input = "{\"id\":1,\"status\":\"active\"}\n{\"id\":2,\"status\":\"inactive\"}\n{\"id\":3,\"status\":\"active\"}";
+        let expected = "{\"id\":1,\"status\":\"active\"}\n{\"id\":3,\"status\":\"active\"}\n";
+        run_processing_test(
+            input,
+            DataFormat::Json,
+            Some("status=active".to_string()),
+            expected,
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn test_process_stream_file_not_found() {
-        // Arrange
-        let non_existent_file = "/tmp/non_existent_file_12345.log";
-        let cli = Cli {
-            input: non_existent_file.to_string(),
-            output: None,
-            format: Format::Json,
-        };
+    async fn test_process_csv_stream_no_filter() {
+        let input = "id,name,value\n1,A,100\n2,B,200";
+        let expected = "{\"id\":\"1\",\"name\":\"A\",\"value\":\"100\"}\n{\"id\":\"2\",\"name\":\"B\",\"value\":\"200\"}\n";
+        run_processing_test(input, DataFormat::Csv, None, expected).await;
+    }
 
-        // Act
-        let result = process_stream(&cli).await;
-
-        // Assert
-        assert!(result.is_err());
-        if let Err(AppError::Io(e)) = result {
-            assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
-        } else {
-            panic!("Expected an I/O error for a non-existent file");
-        }
+    #[tokio::test]
+    async fn test_process_csv_stream_with_filter() {
+        let input = "id,city,status\n1,NY,processed\n2,LA,pending\n3,SF,processed";
+        let expected = "{\"city\":\"NY\",\"id\":\"1\",\"status\":\"processed\"}\n{\"city\":\"SF\",\"id\":\"3\",\"status\":\"processed\"}\n";
+        run_processing_test(
+            input,
+            DataFormat::Csv,
+            Some("status=processed".to_string()),
+            expected,
+        )
+        .await;
     }
 }
